@@ -1,0 +1,221 @@
+<?php
+
+/**
+ * ProcessWire ShibbolethLogin for COTA Module
+ *
+ * Tom Reno (2016)
+ *
+ */
+
+class ShibbolethLoginCOTA extends ShibbolethLoginNew implements Module {
+
+	public static function getModuleInfo() {
+		return array(
+			'title' => 'ShibbolethLoginCOTA',
+			'version' => 100,
+			'summary' => '',
+			'href' => '',
+			'singular' => true,
+			'autoload' => true,
+			'requires' => "ShibbolethLoginNew",
+			'installs' => "ShibbolethLoginNew",
+		);
+	}
+
+	protected $deptID;
+	protected $NMB;
+	protected $affiliations;
+	protected $eduAffiliations;
+	protected $firstName;
+	protected $lastName;
+	protected $email;
+	protected $commonName;
+	protected $dept = "130";
+
+	// Department ID => (PW roles => Primary Affiliations)
+	protected $deptRoles = array(
+    	"13000000" => array("deans-office" => "Dean's Office"),
+    	"13010000" => array("deans-office" => "Dean's Office"),
+		"13010100" => array("deans-office" => "Dean's Office"),
+		"13020000" => array("art-and-art-history" => "School of Art + Art History"),
+		"13020100" => array("art-and-art-history" => "School of Art + Art History"),
+		"13030000" => array("music" => "School of Music"),
+		"13030100" => array("music" => "School of Music"),
+		"13030200" => array("music" => "University of Florida Bands"),
+		"13040000" => array("theatre-and-dance" => "School of Theatre + Dance"),
+		"13040100" => array("theatre-and-dance" => "School of Theatre + Dance"),
+		"13010400" => array("arts-in-medicine" => "Center for Arts in Medicine"),
+		"13020200" => array("gallery" => "University Gallery"),
+		"13050000" => array("digital-worlds-institute" => "Digital Worlds Institute"),
+	);
+
+	public function init() {
+		$this->session->addHookBefore('ShibbolethLoginNew::checkCredentials', $this, 'hookCheckCredentials');
+		$this->session->addHookBefore('ShibbolethLoginNew::updateUser', $this, 'hookUpdateUser');
+		$this->session->addHookBefore('ShibbolethLoginNew::loginUser', $this, 'hookLoginUser');
+		$this->session->addHookAfter('ShibbolethLoginNew::createUser', $this, 'hookCreateUser');
+		$this->session->addHookAfter('ShibbolethLoginNew::shibInit', $this, 'hookShibInit');
+		
+		parent::init();
+	}
+
+	public function hookShibInit(HookEvent $event) {
+
+		// shibInit() returns true if there is a valid shib session.
+		// if there is a session, then populate some properties
+		
+		if ($event->return){
+			$this->deptID = $_SERVER["HTTP_UFSHIB_DEPARTMENTNUMBER"];
+			$this->NMB = substr($_SERVER["HTTP_UFSHIB_NETMANAGED_BY"],0,2);
+			$this->affiliations = strpos($_SERVER["HTTP_UFSHIB_UF_AFFILIATIONS"],":130", 0);
+			$this->eduAffiliations = $_SERVER['HTTP_UFSHIB_EDUPERSON_AFFILIATIONS'];
+			$this->firstName = $_SERVER["HTTP_UFSHIB_GIVENNAME"];
+			$this->lastName = $_SERVER["HTTP_UFSHIB_SN"];
+			$this->email = $_SERVER["HTTP_UFSHIB_MAIL"];
+			$this->commonName = $_SERVER["HTTP_UFSHIB_CN"];
+		}
+		
+	}
+
+	public function hookCheckCredentials(HookEvent $event) {
+
+		$deptPrefix = substr($this->deptID,0,2);
+
+		if (strcmp($deptPrefix, $this->dept) == 0) {
+     		$event->return = true;
+		} else if (strcmp($deptPrefix, $this->NMB) == 0){
+			$event->return = true;
+		} else if ($this->affiliations !== false){
+			$event->return = true;
+		} else if ($this->isSharedServicesUser()){
+			$event->return = true;
+		}
+
+		$event->return = false;
+
+	}
+
+	public function hookUpdateUser(HookEvent $event) {
+		
+		$u = $event->arguments(0);
+		$u = $this->setCommonUserAttributes($u);
+		
+		// Additional fields to update for everyone except SCC users.
+		if (!$this->isSharedServicesUser($u)){
+			$u->email = $this->email; 
+			$u->user_primary_affiliation = $this->getPrimaryAffiliation();
+			
+			// Remove only shibboleth defined roles
+			foreach($u->roles as $role) { 
+				if ($role->set_by->first()->title == "Shibboleth") {
+					$u->removeRole($role);
+				}
+			}
+
+			// Add shibboleth assigned roles each time user authenticates to capture any UF level updates.
+			foreach($this->getRoles() as $role) { 
+				$u->addRole($role);
+			}
+		}
+
+	}
+
+	public function hookCreateUser(HookEvent $event) {
+		$u = $event->return;
+		$u = $this->setCommonUserAttributes($u);
+		$u->user_primary_affiliation = $this->getPrimaryAffiliation();
+		
+		foreach($this->getRoles() as $role) {
+			$u->addRole($role);
+		}
+		
+		$event->return = $u;
+
+	}
+
+	public function setCommonUserAttributes($u) {
+		$u->user_ufid = $this->ufid;
+		$u->user_first_name = $this->getFirstName();
+		$u->user_last_name = $this->getLastName();
+		$u->email = $this->email;
+		$u->user_account_active = 1;
+		
+		return $u;
+	}
+
+	public function hookLoginUser(HookEvent $event) {
+		$u = $event->arguments(0);
+		
+		if ($u->user_account_active == 1) { 
+			$u->removeRole('neverloggedin');
+		} else {
+			throw new ShibAuthorizationException();
+		}
+	}
+
+	public function isSharedServicesUser($u) {
+		if ($u->hasRole("shared-services-user") && $u->template->id == '374'){
+			return true;
+		}
+
+		return false;
+	} 
+
+	public function getRoles() {
+		$roles = array();
+		$staff = strpos($this->eduAffiliations, "STAFF");
+		$faculty = strpos($this->eduAffiliations, "FACULTY");
+		
+		if ($staff !== false && $faculty === false) {
+			$roles[] = "staff";
+		}
+
+		if ($faculty !== false){
+			$roles[] = "faculty";
+		}
+		
+		// add department or center based role
+		$roles[] = key($this->deptRoles[$this->deptID]);
+		
+		if ($this->affiliations) {
+			foreach ($this->deptRoles as $id => $array) {
+				$id = (string) $id; 
+				if (strpos($affiliations, $id, 0) !== false) {
+					$roles[] = key($array);
+				}
+			}
+		}
+
+		return $roles;
+	}
+
+	public function getPrimaryAffiliation() {
+		if (array_key_exists($this->deptID, $this->deptRoles)){
+			return array_values($this->deptRoles[$this->deptID])[0];
+		}
+
+		return false;
+	}
+
+	public function getFirstName(){
+		return $this->checkDirectoryName($this->firstName, 'first');
+	}
+
+	public function getlastName(){
+		return $this->checkDirectoryName($this->lastName, 'last');
+	}
+
+	public function checkDirectoryName($str, $type){
+		if (trim($this->commonName) != '' && strpos($this->commonName, ',') !== false){
+			$directoryName = explode(",", $this->commonName);
+			if ($type == 'first'){
+				$str = trim($directoryName[1]); // set $firstName to user specified Directory Name
+			} else if ($type == 'last'){
+				$str = trim($directoryName[0]); // set $lastName to user specified Directory Name
+			}
+		}
+
+		return $str;
+	}
+
+}

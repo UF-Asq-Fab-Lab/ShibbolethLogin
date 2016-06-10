@@ -1,0 +1,171 @@
+<?php
+
+/**
+ * ProcessWire ShibbolethLogin Module
+ *
+ * Tom Reno (2016)
+ *
+ */
+
+class ShibbolethLoginNew extends WireData implements Module {
+
+	public static function getModuleInfo() {
+		return array(
+			'title' => 'ShibbolethLogin',
+			'version' => 100,
+			'summary' => 'Externalizes PW Authentication to Shibboleth. Allows guest access to any user with a UFID.',
+			'href' => '',
+			'singular' => true,
+			'autoload' => true
+		);
+	}
+
+	protected $ufid;
+	protected $remoteUser;
+	protected $bypassVar = 'superuser';
+	protected $noAccessRedirect = '/404/';
+	protected $defaultRoles = array('guest'); // guest role is required by PW.
+
+	public function __construct() {
+		require_once(__DIR__ . "/ShibbolethLoginException.php");
+	}
+
+	public function init() {
+
+		if (!isset($_GET['beta'])) return;
+
+		// if superuser GET variable is present or the user is already logged in, then skip shib
+		// This will fallback to the native PW login for superusers.
+		if (isset($_GET[$this->bypassVar]) || wire('user')->isLoggedIn()) return;
+
+		$this->session->addHookAfter('ProcessLogin::execute', $this, 'shibLogin');
+		$this->session->addHookBefore('ProcessLogin::renderLoginForm', $this, 'shibLogin');
+		$this->session->addHookBefore('ProcessLogin::executeLogout', $this, 'logoutRedirect');
+
+	}
+
+	public function execute(){
+		// if superuser GET variable is present or the user is already logged in, then skip shib
+		// This will fallback to the native PW login for superusers.
+		if (isset($_GET[$this->bypassVar]) || wire('user')->isLoggedIn()) return;
+		return $this->shibLogin();
+	}
+
+	public function shibLogin() {
+
+		try {
+		    $this->shibInit();
+		    $this->authorizedUser();
+		    $this->processLoginRequest();
+
+		} catch (ShibSessionException $e) {
+       		wire('session')->redirect('/Shibboleth.sso/Login?target='. $_SERVER['REQUEST_URI'] .'');
+
+		} catch (ShibAuthorizationException $e) {
+		     wire('session')->redirect($this->noAccessRedirect);
+		}
+
+	}
+
+	protected function ___shibInit() {
+		$this->ufid = $_SERVER["HTTP_UFSHIB_UFID"];
+		$this->remoteUser = $_SERVER['HTTP_REMOTE_USER'];
+
+		return $this->shibSession();
+	}
+
+	private function shibSession() {
+		if ($this->remoteUser && $this->ufid) {
+			return true;
+		}
+		throw new ShibSessionException();
+	}
+
+	public function authorizedUser(){
+		if ($this->checkCredentials()){
+			return true;
+		}
+		throw new ShibAuthorizationException();
+	}
+
+	// Default allows any user with a valid UFID access as a guest.
+	// This is only useful if you need to put a public page behind shib login.
+	// Otherwise this method should be hooked or replaced in a child module.
+
+	public function ___checkCredentials() {
+		return true;
+	}
+
+	public function processLoginRequest() {
+
+		$u = $this->isUser("name");
+
+		if ($u->id) {
+			$u = $this->updateUser($u);
+		} else {
+			$u = $this->createUser();
+		}
+
+		$this->saveUser($u); // Here so createUser() and updateUser() can be hooked.
+		$this->loginUser($u);
+
+	}
+
+	public function ___isUser($field) {
+		$u = $this->users->get($field."={$this->ufid}");
+		if ($u->id) {
+			return $u;
+		}
+
+		return false;
+	}
+
+	public function ___createUser() {
+		$u = new User();
+		$u->of(false);
+		$u->name = $this->ufid;
+		$u->pass = $this->randomPass();
+		foreach ($this->defaultRoles as $role){
+			$u->addRole($role);
+		}
+
+		return $u;
+	}
+
+	public function ___updateUser($u) {
+		$u->of(false);
+		$u->pass = $this->randomPass();
+		foreach ($this->defaultRoles as $role){
+			$u->addRole($role);
+		}
+
+		return $u;
+	}
+
+	public function saveUser($u) {
+		if ($u instanceof User){
+			$u->save();
+		} else {
+			throw new wireException();
+		}
+	}
+
+	public function ___loginUser($u) {
+		$this->session->login($u->name, $u->pass);
+	}
+
+	// Generate a random password for every login.
+	// I think this is also hashed and salted by PW before being saved in the DB, but not sure.
+	// This method works for now; I'll explore the exact details later.
+	protected function randomPass(){
+		$length = 16;
+		$keys = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';
+		return substr(str_shuffle($keys),0,$length);
+	}
+
+	public function logutRedirect($event) {
+		$this->session->logout();
+		$this->session->redirect('/');
+	}
+
+}
